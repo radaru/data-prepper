@@ -107,7 +107,6 @@ public class KafkaCustomConsumer implements Runnable, ConsumerRebalanceListener 
     private final long maxRetriesOnException;
     private final ExponentialBackoff exponentialBackoff;
     private long authFailureAttempts;
-    private final Map<Integer, Long> partitionToLastReceivedTimestampMillis;
     private final CompressionOption compressionConfig;
     private final boolean invokeCallbackOnExpiry;
 
@@ -136,7 +135,6 @@ public class KafkaCustomConsumer implements Runnable, ConsumerRebalanceListener 
         this.pauseConsumePredicate = pauseConsumePredicate;
         this.topicMetrics.register(consumer);
         this.offsetsToCommit = new HashMap<>();
-        this.partitionToLastReceivedTimestampMillis = new HashMap<>();
         this.ownedPartitionsEpoch = new HashMap<>();
         this.metricsUpdatedTime = Instant.now().getEpochSecond();
         this.acknowledgedOffsets = new ArrayList<>();
@@ -173,18 +171,11 @@ public class KafkaCustomConsumer implements Runnable, ConsumerRebalanceListener 
 
     <T> long getRecordTimeStamp(final ConsumerRecord<String, T> consumerRecord, final long nowMs) {
         final long timestamp = consumerRecord.timestamp();
-        int partition = consumerRecord.partition();
         if (timestamp > nowMs) {
             topicMetrics.getNumberOfInvalidTimeStamps().increment();
-            if (partitionToLastReceivedTimestampMillis.containsKey(partition)) {
-                return partitionToLastReceivedTimestampMillis.get(partition);
-            } else {
-                return nowMs;
-            }
-        } else {
-            partitionToLastReceivedTimestampMillis.put(partition, timestamp);
-            return timestamp;
         }
+        // Preserve the Kafka timestamp; latency calculations handle clock skew separately.
+        return timestamp;
     }
 
     private long getCurrentTimeNanos() {

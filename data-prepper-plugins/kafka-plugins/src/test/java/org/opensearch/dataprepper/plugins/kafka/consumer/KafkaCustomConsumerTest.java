@@ -41,6 +41,7 @@ import org.opensearch.dataprepper.model.CheckpointState;
 import org.opensearch.dataprepper.model.acknowledgements.AcknowledgementSetManager;
 import org.opensearch.dataprepper.model.buffer.Buffer;
 import org.opensearch.dataprepper.model.buffer.SizeOverflowException;
+import org.opensearch.dataprepper.model.codec.ByteDecoder;
 import org.opensearch.dataprepper.model.configuration.PipelineDescription;
 import org.opensearch.dataprepper.model.event.Event;
 import org.opensearch.dataprepper.model.record.Record;
@@ -52,6 +53,7 @@ import org.opensearch.dataprepper.plugins.kafka.configuration.TopicConsumerConfi
 import org.opensearch.dataprepper.plugins.kafka.util.KafkaTopicConsumerMetrics;
 import org.opensearch.dataprepper.plugins.kafka.util.MessageFormat;
 
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.ByteBuffer;
 import java.time.Duration;
@@ -83,6 +85,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.times;
@@ -143,6 +146,7 @@ public class KafkaCustomConsumerTest {
     private final int testPartition = 0;
     private final int testJsonPartition = 1;
     private Counter counter;
+    private Counter invalidTimeStampCounter;
     @Mock
     private Counter posCounter;
     @Mock
@@ -165,6 +169,7 @@ public class KafkaCustomConsumerTest {
         kafkaConsumer = mock(KafkaConsumer.class);
         topicMetrics = mock(KafkaTopicConsumerMetrics.class);
         counter = mock(Counter.class);
+        invalidTimeStampCounter = mock(Counter.class);
         posCounter = mock(Counter.class);
         mockBuffer = mock(Buffer.class);
         negCounter = mock(Counter.class);
@@ -175,11 +180,12 @@ public class KafkaCustomConsumerTest {
         when(topicMetrics.getNumberOfBufferSizeOverflows()).thenReturn(overflowCounter);
         when(topicMetrics.getNumberOfRecordsCommitted()).thenReturn(counter);
         when(topicMetrics.getNumberOfDeserializationErrors()).thenReturn(counter);
-        when(topicMetrics.getNumberOfInvalidTimeStamps()).thenReturn(counter);
+        when(topicMetrics.getNumberOfInvalidTimeStamps()).thenReturn(invalidTimeStampCounter);
         when(topicMetrics.getNumberOfPollAuthErrors()).thenReturn(counter);
         lenient().when(topicMetrics.getNumberOfRebalances()).thenReturn(counter);
         lenient().when(topicMetrics.getNumberOfPartitionsRevoked()).thenReturn(counter);
         when(topicConfig.getThreadWaitingTime()).thenReturn(Duration.ofSeconds(1));
+        when(topicConfig.getMaxPollInterval()).thenReturn(Duration.ofSeconds(30));
         when(topicConfig.getSerdeFormat()).thenReturn(MessageFormat.PLAINTEXT);
         when(topicConfig.getAutoCommit()).thenReturn(false);
         when(kafkaConsumer.committed(any(TopicPartition.class))).thenReturn(null);
@@ -249,16 +255,63 @@ public class KafkaCustomConsumerTest {
         long nowMs = Instant.now().toEpochMilli();
         long timestamp1 = nowMs - 5;
         when(consumerRecord1.timestamp()).thenReturn(timestamp1);
-        when(consumerRecord1.partition()).thenReturn(1);
         assertThat(consumer.getRecordTimeStamp(consumerRecord1, nowMs), equalTo(timestamp1));
         long timestamp2 = nowMs + 5;
         when(consumerRecord2.timestamp()).thenReturn(timestamp2);
-        when(consumerRecord2.partition()).thenReturn(1);
-        assertThat(consumer.getRecordTimeStamp(consumerRecord2, nowMs), equalTo(timestamp1));
+        assertThat(consumer.getRecordTimeStamp(consumerRecord2, nowMs), equalTo(timestamp2));
         long timestamp3 = nowMs + 10;
         when(consumerRecord3.timestamp()).thenReturn(timestamp3);
-        when(consumerRecord3.partition()).thenReturn(2);
-        assertThat(consumer.getRecordTimeStamp(consumerRecord3, nowMs), equalTo(nowMs));
+        assertThat(consumer.getRecordTimeStamp(consumerRecord3, nowMs), equalTo(timestamp3));
+        long laterNowMs = nowMs + Duration.ofMinutes(10).toMillis();
+        when(consumerRecord2.timestamp()).thenReturn(laterNowMs + 5);
+        assertThat(consumer.getRecordTimeStamp(consumerRecord2, laterNowMs), equalTo(laterNowMs + 5));
+        verify(invalidTimeStampCounter, times(3)).increment();
+    }
+
+    @Test
+    public void testFutureKafkaTimestampIsPreservedInEvent() throws Exception {
+        String topic = topicConfig.getName();
+        TopicPartition topicPartition = new TopicPartition(topic, testPartition);
+        long pastTimestamp = System.currentTimeMillis() - 1000;
+        long futureTimestamp = System.currentTimeMillis() + Duration.ofMinutes(1).toMillis();
+        ConsumerRecord<String, Object> pastRecord = new ConsumerRecord<>(topic, testPartition, 0L, pastTimestamp,
+                TimestampType.CREATE_TIME, 0L, 0, 0, testKey1, testValue1, new RecordHeaders());
+        ConsumerRecord<String, Object> futureRecord = new ConsumerRecord<>(topic, testPartition, 1L, futureTimestamp,
+                TimestampType.CREATE_TIME, 0L, 0, 0, testKey2, testValue2, new RecordHeaders());
+        when(kafkaConsumer.poll(any(Duration.class))).thenReturn(new ConsumerRecords<>(
+                Map.of(topicPartition, List.of(pastRecord, futureRecord))));
+        consumer = createObjectUnderTest("plaintext", false);
+        consumer.onPartitionsAssigned(List.of(topicPartition));
+
+        consumer.consumeRecords();
+
+        ArrayList<Record<Event>> bufferedRecords = new ArrayList<>(buffer.read(1000).getKey());
+        assertEquals(2, bufferedRecords.size());
+        Event event = bufferedRecords.get(1).getData();
+        assertThat(event.getMetadata().getAttribute("kafka_timestamp"), equalTo(futureTimestamp));
+        assertThat(event.getMetadata().getExternalOriginationTime(), equalTo(Instant.ofEpochMilli(futureTimestamp)));
+        assertThat(event.getEventHandle().getExternalOriginationTime(), equalTo(Instant.ofEpochMilli(futureTimestamp)));
+        verify(invalidTimeStampCounter).increment();
+    }
+
+    @Test
+    public void testByteDecoderReceivesOriginalFutureKafkaTimestamp() throws Exception {
+        String topic = topicConfig.getName();
+        TopicPartition topicPartition = new TopicPartition(topic, testPartition);
+        long futureTimestamp = System.currentTimeMillis() + Duration.ofMinutes(1).toMillis();
+        ConsumerRecord<String, Object> record = new ConsumerRecord<>(topic, testPartition, 0L, futureTimestamp,
+                TimestampType.CREATE_TIME, 0L, 0, 0, null, new byte[]{1}, new RecordHeaders());
+        when(kafkaConsumer.poll(any(Duration.class))).thenReturn(new ConsumerRecords<>(
+                Map.of(topicPartition, List.of(record))));
+        ByteDecoder byteDecoder = mock(ByteDecoder.class);
+        consumer = new KafkaCustomConsumer(kafkaConsumer, shutdownInProgress, mockBuffer, sourceConfig, topicConfig,
+                "bytes", acknowledgementSetManager, byteDecoder, topicMetrics, pauseConsumePredicate);
+        consumer.onPartitionsAssigned(List.of(topicPartition));
+
+        consumer.consumeRecords();
+
+        verify(byteDecoder).parse(any(InputStream.class), eq(Instant.ofEpochMilli(futureTimestamp)), any());
+        verify(invalidTimeStampCounter).increment();
     }
 
     @ParameterizedTest
